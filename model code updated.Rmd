@@ -16,7 +16,7 @@ knitr::opts_chunk$set(
 
 ```{r packages, include=FALSE}
 packages <- c("dplyr", "tibble", "spOccupancy", "coda",
-              "ggplot2", "stringr", "forcats", "ggspatial", "sf", "leaflet")
+              "ggplot2", "stringr", "forcats", "ggspatial", "sf", "leaflet", "htmlwidgets")
 
 installed <- rownames(installed.packages())
 for (pkg in packages) {
@@ -605,7 +605,7 @@ all_summary2 <- all_summary %>%
 
 ```{r}
 
-ggplot(
+p1 <- ggplot(
   all_summary2 %>% filter(Group == "Patch size and density", Variable != "(Intercept)"),
   aes(x = fct_reorder(CleanName, Mean),
       y = Mean,
@@ -628,7 +628,7 @@ ggplot(
 
 ```{r}
 
-ggplot(
+p2 <- ggplot(
   all_summary2 %>% filter(Group == "Vegetation structure", Variable != "(Intercept)"),
   aes(x = fct_reorder(CleanName, Mean),
       y = Mean,
@@ -650,7 +650,7 @@ ggplot(
 
 ```{r}
 
-ggplot(
+p3 <- ggplot(
   all_summary2 %>% filter(Group == "Vegetation composition", Variable != "(Intercept)"),
   aes(x = fct_reorder(CleanName, Mean),
       y = Mean,
@@ -670,7 +670,7 @@ ggplot(
 
 ```
 ```{r}
-ggplot(
+p4 <- ggplot(
   all_summary2 %>% filter(Group == "Other environment", Variable != "(Intercept)"),
   aes(x = fct_reorder(CleanName, Mean),
       y = Mean,
@@ -690,7 +690,6 @@ ggplot(
 ```
 ```{r}
 
-# Chunk 1: create sp_df (keep this)
 sp_samples <- model$w.samples
 sp_effect_mean <- apply(sp_samples, 2, mean)
 sp_effect_sd   <- apply(sp_samples, 2, sd)
@@ -703,7 +702,6 @@ sp_df <- data.frame(
   sp_effect_sd   = sp_effect_sd
 )
 
-# Chunk 2: plotting
 alpha_scaled <- 1 - sqrt(sp_df$sp_effect_sd / max(sp_df$sp_effect_sd, na.rm = TRUE))
 alpha_scaled <- pmax(alpha_scaled, 0.3)
 
@@ -734,4 +732,43 @@ leaflet(sp_df) %>%
 
 ```
 
+
+```{r}
+ggsave("p1_patch_size_density.jpg", plot = p1, width = 6, height = 4, dpi = 300)
+ggsave("p2_vegetation_structure.jpg", plot = p2, width = 6, height = 4, dpi = 300)
+ggsave("p3_vegetation_composition.jpg", plot = p3, width = 6, height = 4, dpi = 300)
+ggsave("p4_other_environment.jpg", plot = p4, width = 6, height = 4, dpi = 300)
+
+```
+
+```{r}
+
+m <- leaflet(sp_df) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~lon, ~lat,
+    radius = 6,
+    color = ~pal(sp_effect_mean),
+    fillOpacity = ~alpha_scaled,
+    stroke = FALSE
+  ) %>%
+  addLegend(
+    "bottomright", 
+    pal = pal, 
+    values = ~sp_effect_mean, 
+    title = "Mean Spatial Effect"
+  ) %>%
+  addControl("<b>Spatial effect map</b><br>Transparency = uncertainty", position = "topright")
+
+# Save as HTML
+saveWidget(m, "spatial_effect_map.html", selfcontained = TRUE)
+
+```
+
+
+```{r}
+rsconnect::setAccountInfo(name='grking25',
+			  token='88BC1673C42ED6A02A584FAFB1DE1231',
+			  secret='GI9nJ585PFwLT6kP3xkttxemQhWqXHqHMZpEPz+K')
+```
 
