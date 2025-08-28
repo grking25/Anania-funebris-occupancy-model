@@ -1,0 +1,737 @@
+---
+title: "Examining the Relationship Between Vegetation Characteristics and White-Spotted Sable Occupancy in Goldenrod Patches"
+author: "Grace King"
+date: "2025-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+
+```{r packages, include=FALSE}
+packages <- c("dplyr", "tibble", "spOccupancy", "coda",
+              "ggplot2", "stringr", "forcats", "ggspatial", "sf", "leaflet")
+
+installed <- rownames(installed.packages())
+for (pkg in packages) {
+  if (!(pkg %in% installed)) {
+    install.packages(pkg)
+  }
+}
+
+lapply(packages, library, character.only = TRUE)
+
+```
+
+
+
+```{r}
+#detection covariates as matrices
+
+ det_covs_list <- list(
+  time_decimal_bst    = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/time_decimal_bst.csv", row.names = 1)),
+  survey_effort       = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/survey_effort.csv", row.names = 1)),
+  julian_day          = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/julian_day.csv", row.names = 1)),
+  temperature         = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/temperature_matrix.csv", row.names = 1)),
+  rainfall            = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/rainfall_matrix.csv", row.names = 1)),
+  relative_humidity   = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/relative_humidity_matrix.csv", row.names = 1)),
+  cloud_amount        = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/cloud_amount_matrix.csv", row.names = 1)),
+  mean_wind_speed     = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/mean_wind_speed_matrix.csv", row.names = 1)),
+  mean_wind_direction = as.matrix(read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/mean_wind_direction_matrix.csv", row.names = 1))
+)
+
+
+# Combine sites x visits x covariates into 3D array
+n_sites <- nrow(det_covs_list[[1]])
+n_visits <- ncol(det_covs_list[[1]])
+n_det_covs <- length(det_covs_list)
+
+det_cov_array <- array(NA, dim = c(n_sites, n_visits, n_det_covs))
+for(i in seq_along(det_covs_list)) {
+  det_cov_array[,,i] <- det_covs_list[[i]]
+}
+dimnames(det_cov_array) <- list(NULL, NULL, names(det_covs_list))
+```
+
+
+```{r}
+#site-level occupancy covariates
+site_data <- read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/site_data.csv")
+head(site_data)
+```
+
+
+```{r}
+#I’ve added another step here after running the model for the first time and noticing that the dominant_plant and codominant variables created many dummy predictors, which made interpretation difficult. Many of these predictors (e.g., species x as a codominant) were very sparse, sometimes occurring only once, which can lead to unstable parameter estimates. For my ecological questions, the distinction between dominant and codominant species is less important than recording them for the purpose of capturing a more clear picture of the composition of vegetation - recognizing that ecosystems often consist of a few abundant species alongside many rare species (Preston, 1948; MacArthur, 1960; Whittaker, 1965).
+
+#This data is still valuable, but I can use it differently by summarising these prevelent species at each site into functional groups, rather than analysing each individual dummy variable (e.g., dominant_plant_x or codominant_1_y). This approach is more interpretable, better aligned with my ecological questions, and should improve parameter stability. Therefore, I will collapse these variables into presence/absence functional groups and attach them to the site data for modeling. Although this broadens the analysis, it should enhance interpretability and provide clearer ecological insights.
+
+print(site_data$dominant_plant)
+print(site_data$codominant_1)
+print(site_data$codominant_2)
+```
+
+
+```{r}
+
+# Move rownames into a real column called patch_id
+#site_data <- site_data %>%
+#  tibble::rownames_to_column(var = "site_id")
+
+# Check
+head(site_data$patch_id)
+
+
+functional_groups <- list(
+  graminoids = c("Poa_trivialis", "Cynosurus_cristatus", "Unspecified_grass", "Festuca_ovio", 
+                 "Luzula_sylvatica", "Avenella_flexuosa"),
+  legumes = c("Ulex_europaeus"),
+  forbs = c("Plantago_lanceolata", "Solidago_virgaurea", "Chamaenerion_angustifolium",
+            "Succisa_pratensis", "Viola_rivinia"),
+  shrubs = c("Rubus_dasyphyllus", "Rubus_fruticosus", "Rubus_idaeus", "Vaccinium_myrtillus", 
+             "Betula_pubescens", "Hypericum_androsaemum"),
+  ferns = c("Pteridium_aquilinum", "Dryopteris_affinis", "Dryopteris_filix-mas"),
+  bryophytes = c("Hylocomium_spendens", "Rhytidiadelphus_triquetrus", "Thuidium_tamariscinum")
+)
+
+# Species to functional groups
+species_cols <- c("dominant_plant", "codominant_1", "codominant_2")
+species_data <- site_data[, species_cols]
+
+site_fg <- t(apply(species_data, 1, function(x) {
+  fg_presence <- sapply(functional_groups, function(fg) any(x %in% fg, na.rm = TRUE))
+  as.integer(fg_presence)
+}))
+
+site_fg_df <- as.data.frame(site_fg)
+colnames(site_fg_df) <- names(functional_groups)
+
+# Add patch_id from site_data
+site_fg_df$patch_id <- site_data$patch_id
+
+# Occupancy covariates
+occ_cov_basic <- site_data %>%
+  select(patch_id, elevation_m, azimuth, area_m2, goldenrod_density, canopy_cover_percent,
+         bare_ground_percent, litter_cover_percent, herbaceous_cover, woody_cover,
+         sward_height, woody_height, lower_vo_avg, upper_vo_avg)
+
+# Join with functional groups
+occ_cov_fg <- left_join(occ_cov_basic, site_fg_df, by = "patch_id")
+
+# Drop patch_id when fitting model
+occ_cov <- occ_cov_fg %>% select(-patch_id)
+
+# Inspect
+head(occ_cov)
+
+
+
+```
+
+```{r}
+
+#check for collinearity among numeric occupancy covariates
+numeric_covs <- occ_cov %>% select(where(is.numeric))
+cor_matrix <- cor(numeric_covs, use = "pairwise.complete.obs")
+round(cor_matrix, 2)
+
+```
+
+
+```{r}
+
+# high correlations (> 0.7)
+high_corr <- which(abs(cor_matrix) > 0.7 & abs(cor_matrix) < 1, arr.ind = TRUE)
+high_corr
+
+
+```
+
+```{r}
+
+#I have multicollinearity among lower_vo_avg, canopy_cover_percent, woody_cover, legumes and woody_height. I will need to either do a pca/pcas, do separate models, or delete. I will try and do a pca as I don't want to lose information or overcomplicate my workflow if possible. I can't use binary data in a pca so will have to leave out legumes.
+
+veg_vars <- occ_cov %>% select(lower_vo_avg, upper_vo_avg,
+                               canopy_cover_percent, woody_cover, woody_height, sward_height)
+
+pca_veg <- prcomp(veg_vars, center = TRUE, scale. = TRUE)
+
+# Scree plot for variance explained
+barplot(pca_veg$sdev^2 / sum(pca_veg$sdev^2),
+        main = "Vegetation PCA variance",
+        names.arg = paste0("PC", 1:length(pca_veg$sdev)))
+
+#install.packages("factoextra")
+library(factoextra)
+
+fviz_pca_biplot(pca_veg, 
+                repel = TRUE,       
+                col.var = "red",    
+                col.ind = "black",  
+                geom.ind = "point", 
+                alpha.ind = 0.6,    
+                arrowsize = 0.8)    
+
+
+
+```
+
+```{r}
+
+# Add PCA scores to occ_cov (first few components)
+occ_cov$PC1 <- pca_veg$x[,1]
+occ_cov$PC2 <- pca_veg$x[,2]
+occ_cov$PC3 <- pca_veg$x[,3]
+occ_cov$PC4 <- pca_veg$x[,4]
+
+
+```
+
+
+
+```{r}
+
+# Scaling occupancy covariates without causing NAsor scaling PCs
+safe_scale_occ_cov <- function(df, skip_prefix = "veg_PC") {
+  df_scaled <- df
+  numeric_cols <- names(df)[sapply(df, is.numeric)]
+  
+  # Exclude columns starting with skip_prefix
+  numeric_cols <- numeric_cols[!startsWith(numeric_cols, skip_prefix)]
+  
+  for (col in numeric_cols) {
+    col_vals <- df[[col]]
+    
+    if (all(is.na(col_vals))) {
+      # all NA -> leave as-is
+      df_scaled[[col]] <- col_vals
+    } else if (sd(col_vals, na.rm = TRUE) == 0) {
+      # constant column -> leave as-is
+      df_scaled[[col]] <- col_vals
+    } else {
+      # scale safely
+      df_scaled[[col]] <- as.numeric(scale(col_vals))
+    }
+  }
+  return(df_scaled)
+}
+
+
+
+# Scaling det covs without causing NAs
+safe_scale_list <- function(cov_list) {
+  lapply(cov_list, function(mat) {
+    scaled_mat <- apply(mat, 2, function(col) {
+      if (all(is.na(col))) {
+        return(col)  # all NA
+      } else if (sd(col, na.rm = TRUE) == 0) {
+        return(col)  # constant
+      } else {
+        return(as.numeric(scale(col)))  # scale
+      }
+    })
+    # Keep matrix structure
+    matrix(scaled_mat, nrow = nrow(mat), dimnames = dimnames(mat))
+  })
+}
+
+
+# Apply scaling
+occ_cov <- safe_scale_occ_cov(occ_cov, skip_prefix = c("PC", "graminoids", "legumes", "forbs", "shrubs", "ferns", "bryophytes"))
+# occupancy covariates
+det_covs_list <- safe_scale_list(det_covs_list)  # detection covariates
+
+```
+
+
+
+```{r}
+
+# Load detection/non-detection matrix y and coordinates
+y <- as.matrix(
+  read.csv(
+    "https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/detection_matrix.csv",
+    row.names = 1
+  )
+)
+coords_matrix <- as.matrix(
+  read.csv("https://raw.githubusercontent.com/grking25/Anania-funebris-occupancy-model/main/patch_coords.csv")[, c("easting", "northing")]
+)
+
+
+```
+
+
+```{r}
+
+# Define model formulas using PCA covariates
+
+occ_formula <- ~ elevation_m + azimuth + area_m2 + goldenrod_density +
+  bare_ground_percent + litter_cover_percent + herbaceous_cover +
+  PC1 + PC2 + PC3 +PC4 + graminoids + forbs + shrubs + ferns + bryophytes
+
+
+det_formula <- ~ time_decimal_bst + survey_effort + julian_day + temperature + rainfall +
+  relative_humidity + cloud_amount + mean_wind_speed + mean_wind_direction
+
+
+```
+
+
+```{r}
+
+# Prepare data for spOccupancy
+data_list <- list(
+  y = y,
+  occ.covs = occ_cov,
+  det.covs = det_covs_list,
+  coords = coords_matrix
+)
+
+```
+
+
+
+```{r}
+# Set MCMC parameters 
+n.batch <- 400
+batch.length <- 200
+n.burn <- 10000
+n.thin <- 20
+n.chains <- 3
+
+# Fit the spatial single-species occupancy model
+model <- spPGOcc(
+  occ.formula = occ_formula,
+  det.formula = det_formula,
+  data = data_list,
+  cov.model = "exponential",
+  n.batch = n.batch,
+  batch.length = batch.length,
+  n.burn = n.burn,
+  n.thin = n.thin,
+  n.chains = n.chains,
+  verbose = FALSE,
+  n.report = 0
+)
+
+
+summary(model)
+
+
+```
+
+
+```{r}
+
+
+pp_check_ft <- spOccupancy::ppcOcc(
+  model, 
+  fit.stat = "freeman-tukey", 
+  group = 2  # site-level check
+)
+
+summary(pp_check_ft)
+
+#The spatial model posterior estimates for sigma.sq and phi suggests space does have an effect as the mean is not 0 but the size of this effect is somewhat uncertain/imprecise because the credible interval is wide.
+
+```
+
+```{r}
+# Non-spatial model for comparison
+data_list_nonspatial <- list(
+  y = y,
+  occ.covs = occ_cov,
+  det.covs = det_covs_list
+)
+
+model_nonspatial <- PGOcc(
+  occ.formula = occ_formula,
+  det.formula = det_formula,
+  data = data_list_nonspatial,
+  n.samples = 80000,
+  n.burn = n.burn,
+  n.thin = n.thin,
+  n.chains = n.chains,
+  verbose = FALSE,
+  n.report = 0
+)
+
+
+summary(model_nonspatial)
+
+```
+
+
+```{r}
+
+pp_check_ft <- spOccupancy::ppcOcc(
+  model_nonspatial, 
+  fit.stat = "freeman-tukey", 
+  group = 2  # site-level check
+)
+
+summary(pp_check_ft)
+
+```
+
+```{r}
+waic_spatial <- waicOcc(model)
+waic_nonspatial <- waicOcc(model_nonspatial)
+
+cbind(Spatial = waic_spatial, NonSpatial = waic_nonspatial)
+
+```
+
+```{r}
+
+# Naive observed occupancy per site (ignore NAs)
+y_naive <- apply(data_list_nonspatial$y, 1, function(x) {
+  if(all(is.na(x))) {
+    NA
+  } else {
+    max(x, na.rm = TRUE)
+  }
+})
+
+
+
+# Posterior mean site-level occupancy probabilities
+psi_hat <- apply(model_nonspatial$psi.samples, 2, mean)
+
+# Now your residuals calculation will work
+resid_occ <- y_naive - psi_hat
+
+resid_occ <- y_naive - psi_hat
+
+# Load packages
+library(spdep)
+library(ncf)
+
+# Prepare numeric coordinates matrix
+coords <- as.matrix(coords_matrix[, c("easting", "northing")])
+
+# Subset sites with valid residuals
+valid_idx <- which(!is.na(resid_occ))
+resid_occ_valid <- resid_occ[valid_idx]
+coords_valid <- coords[valid_idx, ]
+
+# Check
+length(resid_occ_valid)
+summary(model_nonspatial$psi.samples)
+any(is.na(model_nonspatial$psi.samples))
+
+# Build distance-based neighbors
+dthresh <- 500  # distance threshold in same units as coords
+nb <- dnearneigh(coords_valid, 0, dthresh)
+lw <- nb2listw(nb, style = "W")
+
+# Moran's I test
+moran_test <- moran.test(resid_occ_valid, lw)
+print(moran_test)
+
+# Spatial correlogram
+correlog_result <- correlog(
+  x = coords_valid[,1],
+  y = coords_valid[,2],
+  z = resid_occ_valid,
+  increment = 500,
+  resamp = 1000
+)
+plot(correlog_result, main = "Spatial correlogram of occupancy residuals")
+
+
+```
+
+
+
+```{r}
+# Both models have very similar performance. The spatial random effect did not improve fit in any meaningful way but the residuals from the non-spatial model show significant positive spatial autocorrelation (Moran’s I = 0.071, p ≈ 0.0007). This indicates that there is spatial structure in the data that the non-spatial model does not account for. Therefore, even if the exact range of spatial correlation are uncertain, including a spatial random effect in the model is justified to account for non-independence among sites and avoid biased parameter estimates. I will use my spatial model for the rest of my analysis.
+
+library(dplyr)
+
+# Compute posterior summaries
+beta_samples <- model$beta.samples  # mcmc object
+
+beta_summary <- data.frame(
+  Variable = colnames(beta_samples),
+  Mean = apply(beta_samples, 2, mean),
+  SD = apply(beta_samples, 2, sd),
+  Q2.5 = apply(beta_samples, 2, quantile, probs = 0.025),
+  Median = apply(beta_samples, 2, median),
+  Q97.5 = apply(beta_samples, 2, quantile, probs = 0.975)
+)
+
+beta_summary
+
+
+```
+
+```{r}
+
+loadings_veg <- summary(pca_veg)$rotation
+print(loadings_veg)
+
+```
+
+```{r}
+# Extract posterior samples from PCAs
+
+occ_samples <- as.matrix(model_nonspatial$beta.samples)   #occ_covariates
+det_samples <- as.matrix(model_nonspatial$alpha.samples)  #det_covariates
+
+colnames(occ_samples) <- colnames(model_nonspatial$X)
+colnames(det_samples) <- colnames(model_nonspatial$X.p)
+
+
+pcs_in_model <- c("PC1", "PC2", "PC3", "PC4")  
+
+loadings_sub <- pca_veg$rotation[, pcs_in_model, drop = FALSE]
+
+
+# Back-projection function
+
+backproject_pca <- function(occ_samples, loadings, pcs) {
+  pcs <- pcs[pcs %in% colnames(occ_samples)]
+  pc_samples <- occ_samples[, pcs, drop = FALSE]
+  var_samples <- pc_samples %*% t(loadings)
+  
+  var_summary <- apply(var_samples, 2, function(x) {
+    c(Mean = mean(x),
+      SD   = sd(x),
+      `2.5%` = quantile(x, 0.025),
+      `50%`  = quantile(x, 0.5),
+      `97.5%`= quantile(x, 0.975))
+  })
+  
+  var_summary_df <- as.data.frame(t(var_summary))
+  colnames(var_summary_df) <- c("Mean", "SD", "2.5%", "50%", "97.5%")  # <- fix
+  var_summary_df$Variable <- rownames(loadings)
+  rownames(var_summary_df) <- NULL
+  var_summary_df <- var_summary_df[, c("Variable", "Mean", "SD", "2.5%", "50%", "97.5%")]
+  
+  return(var_summary_df)
+}
+
+
+# Run back-projection
+veg_backproj <- backproject_pca(occ_samples, loadings_sub, pcs_in_model)
+
+# Inspect results
+print(veg_backproj)
+
+```
+
+```{r}
+
+# Extract summaries for non-PCA covariates
+non_pca_vars <- setdiff(colnames(occ_samples), pcs_in_model)
+non_pca_vars <- non_pca_vars
+
+# Initialize empty list
+summary_list <- list()
+
+for (var in non_pca_vars) {
+  x <- occ_samples[, var]
+  summary_list[[var]] <- data.frame(
+    Variable = var,
+    Mean   = mean(x),
+    SD     = sd(x),
+    Q2.5   = quantile(x, 0.025),
+    Median = quantile(x, 0.5),
+    Q97.5  = quantile(x, 0.975)
+  )
+}
+
+# Combine into one data frame
+non_pca_summary_df <- do.call(rbind, summary_list)
+
+# Inspect
+print(non_pca_summary_df)
+
+# Combine PCA and non-PCA summaries
+all_summary <- rbind(
+  veg_backproj %>% rename(Q2.5 = `2.5%`, Q97.5 = `97.5%`, Median = `50%`),
+  non_pca_summary_df
+)
+
+
+```
+
+
+```{r}
+#Now my results are ready to visualise but I have quite a lot of variables - I might group them based on my research questions:
+
+#How do the size of a goldenrod patch and the density of goldenrod plants within it influence the occupancy of Anania funebris? 
+#How does vegetation structure, including canopy cover, vegetation density, and ground cover, influence the occupancy of Anania funebris? 
+#How does vegetation composition of a goldenrod patch affect the occupancy of Anania funebris? 
+
+print(all_summary$Variable)
+
+```
+
+
+```{r}
+
+all_summary2 <- all_summary %>%
+  # Create Group variable
+  mutate(Group = case_when(
+    Variable %in% c("area_m2", "goldenrod_density") ~ "Patch size and density",
+    Variable %in% c("lower_vo_avg", "upper_vo_avg", "canopy_cover_percent",
+                    "woody_cover", "woody_height", "sward_height",
+                    "bare_ground_percent", "litter_cover_percent",
+                    "herbaceous_cover") ~ "Vegetation structure",
+    Variable %in% c("graminoids", "forbs", "shrubs", "ferns", "bryophytes") ~ "Vegetation composition",
+    Variable %in% c("PC1", "PC2", "PC3", "PC4") ~ "Vegetation PCA",
+    Variable %in% c("elevation_m", "azimuth") ~ "Other environment",
+    TRUE ~ "Other"
+  )) %>%
+  # Create significance variable
+  mutate(Credible_Effect = (Q2.5 > 0 & Q97.5 > 0) | (Q2.5 < 0 & Q97.5 < 0)) %>%
+  # Clean variable names for plotting
+  mutate(CleanName = Variable,
+         CleanName = gsub("_", " ", CleanName)
+  )
+
+
+```
+
+
+```{r}
+
+ggplot(
+  all_summary2 %>% filter(Group == "Patch size and density", Variable != "(Intercept)"),
+  aes(x = fct_reorder(CleanName, Mean),
+      y = Mean,
+      color = Credible_Effect)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+  scale_color_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "grey70"),
+                     labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+  coord_flip() +
+  labs(title = "Patch size & density",
+       y = "Effect on occupancy (logit scale)", x = "", color = "Credible effect") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+```
+
+
+```{r}
+
+ggplot(
+  all_summary2 %>% filter(Group == "Vegetation structure", Variable != "(Intercept)"),
+  aes(x = fct_reorder(CleanName, Mean),
+      y = Mean,
+      color = Credible_Effect)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+  scale_color_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "grey70"),
+                     labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+  coord_flip() +
+  labs(title = "Vegetation structure",
+       y = "Effect on occupancy (logit scale)", x = "", color = "Credible effect") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+```
+
+```{r}
+
+ggplot(
+  all_summary2 %>% filter(Group == "Vegetation composition", Variable != "(Intercept)"),
+  aes(x = fct_reorder(CleanName, Mean),
+      y = Mean,
+      color = Credible_Effect)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+  scale_color_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "grey70"),
+                     labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+  coord_flip() +
+  labs(title = "Vegetation Composition",
+       y = "Effect on occupancy (logit scale)", x = "", color = "Credible effect") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+```
+```{r}
+ggplot(
+  all_summary2 %>% filter(Group == "Other environment", Variable != "(Intercept)"),
+  aes(x = fct_reorder(CleanName, Mean),
+      y = Mean,
+      color = Credible_Effect)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0.2) +
+  scale_color_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "grey70"),
+                     labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+  coord_flip() +
+  labs(title = "Other environmental covariates",
+       y = "Effect on occupancy (logit scale)", x = "", color = "Credible effect") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+```{r}
+
+# Chunk 1: create sp_df (keep this)
+sp_samples <- model$w.samples
+sp_effect_mean <- apply(sp_samples, 2, mean)
+sp_effect_sd   <- apply(sp_samples, 2, sd)
+
+sp_df <- data.frame(
+  patch_id = site_data$patch_id,
+  easting = coords[, "easting"],
+  northing = coords[, "northing"],
+  sp_effect_mean = sp_effect_mean,
+  sp_effect_sd   = sp_effect_sd
+)
+
+# Chunk 2: plotting
+alpha_scaled <- 1 - sqrt(sp_df$sp_effect_sd / max(sp_df$sp_effect_sd, na.rm = TRUE))
+alpha_scaled <- pmax(alpha_scaled, 0.3)
+
+pal <- colorNumeric(palette = c("blue", "white", "red"), domain = sp_df$sp_effect_mean)
+
+coords_sf <- st_as_sf(sp_df, coords = c("easting", "northing"), crs = 32630)
+coords_sf <- st_transform(coords_sf, 4326)
+sp_df$lon <- st_coordinates(coords_sf)[,1]
+sp_df$lat <- st_coordinates(coords_sf)[,2]
+
+leaflet(sp_df) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    ~lon, ~lat,
+    radius = 6,
+    color = ~pal(sp_effect_mean),
+    fillOpacity = ~alpha_scaled,
+    stroke = FALSE
+  ) %>%
+  addLegend(
+    "bottomright", 
+    pal = pal, 
+    values = ~sp_effect_mean, 
+    title = "Mean Spatial Effect"
+  ) %>%
+  addControl("<b>Spatial effect map</b><br>Transparency = uncertainty", position = "topright")
+
+
+```
+
+
